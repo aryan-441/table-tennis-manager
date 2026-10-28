@@ -22,3 +22,5 @@ This is a work in progress. Match-state correctness, tournament edge cases, inpu
 No authored project date is stated in the script. Drive lists the source file as created 2025-12-27 and modified 2026-10-11; these are file metadata dates, not confirmed start/release dates.
 
 No license has been selected.
+
+**Source file dates in Drive File Explorer:** Created 27 December 2025; last modified 11 October 2026. These are file metadata dates, not a verified coding timeline.

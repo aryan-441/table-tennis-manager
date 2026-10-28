@@ -4,3 +4,14 @@ __pycache__/
 venv/
 .env
 players.json
+
+# Local credentials and machine-specific secrets
+.env
+.env.*
+!.env.example
+secrets/
+secrets.*
+credentials.*
+*.pem
+*.p12
+*.pfx
