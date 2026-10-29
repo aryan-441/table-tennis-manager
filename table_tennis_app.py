@@ -2,6 +2,9 @@
 import uuid
 import json
 import random
+import os
+import tempfile
+from pathlib import Path
 
 
 
@@ -19,6 +22,7 @@ ALLOWED_PLAY_STYLES = [
 EVENT_POINT = "POINT"
 EVENT_UNDO = "UNDO_POINT"
 EVENT_FAULT = "FAULT"
+EVENT_LET = "LET"
 
 
 class Player:
@@ -61,7 +65,66 @@ class Player:
 
     @staticmethod
     def from_dict(player_data):
-       
+        if not isinstance(player_data, dict):
+            raise ValueError("Player data must be a dictionary.")
+
+        required_fields = {
+            "player_id",
+            "name",
+            "grip",
+            "playing_hand",
+            "play_style",
+            "elo_rating",
+            "matches_won",
+            "matches_lost",
+            "points_scored",
+            "points_conceded",
+        }
+
+        missing_fields = required_fields - player_data.keys()
+        if missing_fields:
+            raise ValueError(
+                f"Missing required fields: {', '.join(sorted(missing_fields))}"
+            )
+
+        if not isinstance(player_data["player_id"], str):
+            raise ValueError("'player_id' must be a string.")
+
+        if not isinstance(player_data["name"], str) or not player_data["name"].strip():
+            raise ValueError("'name' must be a non-empty string.")
+
+        if player_data["grip"] not in ALLOWED_GRIPS:
+            raise ValueError(f"Invalid grip: {player_data['grip']!r}")
+
+        if player_data["playing_hand"] not in ALLOWED_PLAYING_HANDS:
+            raise ValueError(f"Invalid playing hand: {player_data['playing_hand']!r}")
+
+        if player_data["play_style"] not in ALLOWED_PLAY_STYLES:
+            raise ValueError(f"Invalid play style: {player_data['play_style']!r}")
+
+        number_fields = (
+            "elo_rating",
+            "matches_won",
+            "matches_lost",
+            "points_scored",
+            "points_conceded",
+        )
+        for field in number_fields:
+            value = player_data[field]
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError(f"'{field}' must be a number.")
+
+        count_fields = (
+            "matches_won",
+            "matches_lost",
+            "points_scored",
+            "points_conceded",
+        )
+        for field in count_fields:
+            value = player_data[field]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"'{field}' must be a non-negative integer.")
+
         player = Player(
             name=player_data["name"],
             grip=player_data["grip"],
@@ -87,30 +150,71 @@ class StorageManager:
         self.filename = filename
 
     def save_players(self, players):
-        data = {}
+        data = {player_id: player.to_dict() for player_id, player in players.items()}
+        
 
-        for player_id, player in players.items():
-            data[player_id] = player.to_dict()
+        target = Path(self.filename)
+        temp_name = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode='w',
+                encoding='utf-8',
+                dir=target.parent,
+                delete=False,
 
-        with open(self.filename, "w") as file:
-            json.dump(data, file, indent=4)
+            ) as temp_file:
+                temp_name = temp_file.name
+                json.dump(data, temp_file, indent=4)
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+            os.replace(temp_name, target)
+        except Exception:
+            if temp_name and os.path.exists(temp_name):
+                os.remove(temp_name)
+            raise
+
+
 
     def load_players(self):
         try:
-            with open(self.filename, "r") as file:
+            with open(self.filename, "r", encoding="utf-8") as file:
                 data = json.load(file)
         except FileNotFoundError:
             return {}
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"Player file {self.filename!r} contains invalid JSON "
+                f"at line {error.lineno}, column {error.colno}."
+            ) from error
+
+        if not isinstance(data, dict):
+            raise ValueError("Player file must contain a JSON object.")
 
         players = {}
 
         for player_id, player_data in data.items():
-            players[player_id] = Player.from_dict(player_data)
+            try:
+                player = Player.from_dict(player_data)
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"Invalid player record {player_id!r}: {error}"
+                ) from error
+
+            if player.player_id != player_id:
+                raise ValueError(
+                    f"Player ID mismatch: file key {player_id!r}, "
+                    f"record ID {player.player_id!r}."
+                )
+            players[player_id] = player
 
         return players
 
 
 def add_player(players, name, grip, playing_hand, play_style):
+    name = name.strip()
+    if not name:
+        print("Player name cannot be empty.")
+        return
     if grip not in ALLOWED_GRIPS:
         print("Invalid grip.")
         return
@@ -189,6 +293,8 @@ def create_match(players):
         )
     elif choice == '2':
         player_one = choose_player_from_list(players)
+        if player_one is None:
+            return
     else:
         print("Invalid input.")
         return
@@ -203,7 +309,8 @@ def create_match(players):
 
     if choice == "1":
         player_two = choose_player_from_list(players)
-        
+        if player_two is None:
+            return
 
     elif choice == "2":
         name = input("Enter player name: ")
@@ -256,11 +363,15 @@ def create_match(players):
     return Match(player_one, player_two, game_config)
 
 class Game:
-    def __init__(self, player_one, player_two, game_config, save_results):
+    def __init__(self, player_one, player_two, game_config, save_results,
+                 initial_server=None):
         self.player_one = player_one
         self.player_two = player_two
         self.game_config = game_config
         self.save_results = save_results
+        self.initial_server_id = (
+            initial_server.player_id if initial_server is not None else None
+        )
 
         '''self.games_won = {
             player_one.player_id: 0,
@@ -283,17 +394,31 @@ class Game:
         self.current_game_score[self.player_one.player_id] = 0
         self.current_game_score[self.player_two.player_id] = 0
 
-        undone_event_ids = set()
+        undone_event_ids = {
+            event['undone_event_id']
+            for event in self.events
+            if event.get('type') == EVENT_UNDO
+            and 'undone_event_id' in event
+        }
 
         for event in self.events:
-            if event["type"] == EVENT_UNDO:
-                if "undone_event_id" in event:
-                    undone_event_ids.add(event["undone_event_id"])
-        for event in self.events:
-            if event['type'] == EVENT_POINT:
-                self.current_game_score[event['player_id']] += 1
+            if event.get('type') != EVENT_POINT:
+                continue
+            if event.get('event_id') in undone_event_ids:
+                continue
+            player_id = event.get('player_id')
+            if player_id not in self.current_game_score:
+                raise ValueError(f'Point event has invalid player id: {player_id}')
 
-    def add_point(self,scoring_player):
+            self.current_game_score[player_id] += 1
+
+
+    def add_point(self, scoring_player, server_id=None):
+        if self.current_game_finished:
+            print("This game has finished. No more points can be added.")
+            return
+        if scoring_player not in (self.player_one, self.player_two):
+            raise ValueError("Scoring player must be one of the players in this game.")
         #while self.current_game_finished == False:
         
             #point_winner = input("Point Winner (1/2):  ")
@@ -309,13 +434,17 @@ class Game:
         event = {
             "type": EVENT_POINT,
             "event_id": str(uuid.uuid4()),
-            "player_id": scoring_player.player_id
+            "player_id": scoring_player.player_id,
+            "server_id": server_id,
         }
         self.events.append(event)
 
         self.recalculate_current_game_score()
         self.check_game_finished()
-    def add_fault(self,fault_player):
+    def add_fault(self, fault_player, server_id=None):
+        if self.current_game_finished:
+            print("This game has finished. No more faults can be recorded.")
+            return
         if fault_player == self.player_one:
             scoring_player = self.player_two
         elif fault_player == self.player_two:
@@ -326,7 +455,8 @@ class Game:
         point_event = {
                     "type": EVENT_POINT,
                     'event_id':str(uuid.uuid4()),
-                    "player_id": scoring_player.player_id}
+                    "player_id": scoring_player.player_id,
+                    "server_id": server_id}
         fault_event = {
             'type' : EVENT_FAULT,
             "event_id": str(uuid.uuid4()),
@@ -341,6 +471,19 @@ class Game:
         self.events.append(fault_event)
         self.recalculate_current_game_score()
         self.check_game_finished()
+
+    def add_let(self, server_id=None):
+        """Record a let without awarding a point."""
+        if self.current_game_finished:
+            print("This game has finished. No more lets can be recorded.")
+            return
+        if server_id not in (self.player_one.player_id, self.player_two.player_id):
+            raise ValueError("Let event must identify a valid server.")
+        self.events.append({
+            "type": EVENT_LET,
+            "event_id": str(uuid.uuid4()),
+            "server_id": server_id,
+        })
 
 
     def check_game_finished(self):
@@ -391,11 +534,15 @@ class Game:
         else:
             pass'''
     def reset_current_game(self):
+        if self.events:
+            raise RuntimeError(
+                "Cannot reset a game with recorded events without losing its audit history. "
+                "Create a new Game instance instead."
+            )
         self.current_game_finished  = False
         self.current_game_winner = None
         self.current_game_score[self.player_one.player_id] = 0
         self.current_game_score[self.player_two.player_id] = 0
-        self.events.clear()
     
 
 
@@ -406,6 +553,8 @@ class Game:
                 if event['type'] == EVENT_UNDO
                 and 'undone_event_id' in event  #set comprehension
             }
+
+            last_point = None
             for event in reversed(self.events):
                 if event['type'] != EVENT_POINT:
                     continue
@@ -511,7 +660,7 @@ def score_check(game):
     print("1 -", game.player_one.name)
     print("2 -", game.player_two.name)
 
-    choice = input("Enter 1 or 2: ")
+    choice = input("Enter choice (1-5): ")
 
         if choice == "1":
             engine.add_point(player_one)
@@ -531,13 +680,13 @@ def input_point_winner(game,match):
     print("4 - Let")
     print("5 - Undo")
 
-    choice = input("Enter 1 or 2: ")
+    choice = input("Enter choice (1-5): ")
     if choice == "1":
-        game.add_point(game.player_one)
+        game.add_point(game.player_one, match.server.player_id)
         match.update_server(game)
 
     elif choice == "2":
-        game.add_point(game.player_two)
+        game.add_point(game.player_two, match.server.player_id)
         match.update_server(game)
 
     elif choice == "3":
@@ -548,22 +697,24 @@ def input_point_winner(game,match):
         fault_player = input("Enter 1 or 2: ")
 
         if fault_player == "1":
-            game.add_fault(game.player_one)
+            game.add_fault(game.player_one, match.server.player_id)
             match.update_server(game)
 
         elif fault_player == "2":
-            game.add_fault(game.player_two)
+            game.add_fault(game.player_two, match.server.player_id)
             match.update_server(game)
 
         else:
             print("Invalid input.")
 
     elif choice == "4":
+        game.add_let(match.server.player_id)
         print("Let — no point awarded.")
 
     elif choice == "5":
         reason = input("Reason for undo: ")
         game.undo_last_point(reason)
+        match.update_server(game)
 
     else:
         print("Invalid input. Try again.")
@@ -577,25 +728,38 @@ def print_final_match_results(match):
 def run_match(match):
     while not match.match_finished:
         if match.server is None:
-        
-        
             match.set_server_from_toss()
-        else:
-            if match.server == match.player_one:
-                match.server = match.player_two
-            else:
-                match.server = match.player_one
+        elif match.games:
+            previous_first_server_id = match.games[-1].initial_server_id
+            match.server = (
+                match.player_two
+                if previous_first_server_id == match.player_one.player_id
+                else match.player_one
+            )
 
         game = Game(
             player_one=match.player_one,
             player_two=match.player_two,
             game_config=match.game_config,
-            save_results=True
+            save_results=True,
+            initial_server=match.server,
         )
         print(f"\n{match.server.name} is serving to start the game.")
-        while not game.current_game_finished:
-            input_point_winner(game,match)
-        print(f"Game winner: {game.current_game_winner.name}")
+        while True:
+            while not game.current_game_finished:
+                input_point_winner(game, match)
+
+            print(f"Game winner: {game.current_game_winner.name}")
+            choice = input("(1) Accept game result | (2) Undo last point: ")
+            if choice == "1":
+                break
+            if choice == "2":
+                reason = input("Reason for undo: ")
+                game.undo_last_point(reason)
+                match.update_server(game)
+                continue
+            print("Invalid input.")
+
         print("\nEVENT HISTORY:")
         print(game.events)
         match.games.append(game)
@@ -621,11 +785,43 @@ def run_match(match):
                 break
 
     if match.match_winner is not None:
-        EloSystem.update_score(
-            match.player_one,
-            match.player_two,
-            match.match_winner
-        )
+        if not match.rating_updated:
+            EloSystem.update_score(
+                match.player_one,
+                match.player_two,
+                match.match_winner
+            )
+            match.rating_updated = True
+
+        if not match.records_updated:
+            point_counts = {
+                match.player_one.player_id: 0,
+                match.player_two.player_id: 0,
+            }
+            for completed_game in match.games:
+                undone_event_ids = {
+                    event.get("undone_event_id")
+                    for event in completed_game.events
+                    if event.get("type") == EVENT_UNDO
+                }
+                for event in completed_game.events:
+                    if (
+                        event.get("type") == EVENT_POINT
+                        and event.get("event_id") not in undone_event_ids
+                        and event.get("player_id") in point_counts
+                    ):
+                        point_counts[event["player_id"]] += 1
+
+            p1 = match.player_one
+            p2 = match.player_two
+            p1.points_scored += point_counts[p1.player_id]
+            p2.points_scored += point_counts[p2.player_id]
+            p1.points_conceded += point_counts[p2.player_id]
+            p2.points_conceded += point_counts[p1.player_id]
+            match.match_winner.matches_won += 1
+            loser = p2 if match.match_winner == p1 else p1
+            loser.matches_lost += 1
+            match.records_updated = True
 
     print_final_match_results(match)
     
@@ -648,6 +844,41 @@ def run_match(match):
 
 class Match:
     def __init__(self,player_one,player_two,game_config):
+        if player_one is None or player_two is None:
+            raise ValueError("Both match players must be provided.")
+        if not getattr(player_one, "player_id", None) or not getattr(player_two, "player_id", None):
+            raise ValueError("Both match players must have valid player IDs.")
+        if player_one.player_id == player_two.player_id:
+            raise ValueError("A player cannot play against themselves.")
+        if not isinstance(game_config, dict):
+            raise ValueError("Game configuration must be a dictionary.")
+        required_config = {
+            "points_per_game",
+            "deuce_enabled",
+            "golden_point_enabled",
+            "games_needed_to_win",
+        }
+        missing_config = required_config - game_config.keys()
+        if missing_config:
+            raise ValueError(
+                f"Game configuration is missing: {', '.join(sorted(missing_config))}"
+            )
+        if game_config["points_per_game"] not in (11, 21):
+            raise ValueError("Points per game must be 11 or 21.")
+        if not isinstance(game_config["deuce_enabled"], bool) or not isinstance(
+            game_config["golden_point_enabled"], bool
+        ):
+            raise ValueError("Deuce and golden-point settings must be true or false.")
+        if game_config["deuce_enabled"] == game_config["golden_point_enabled"]:
+            raise ValueError("Enable exactly one of deuce or golden point.")
+        games_needed = game_config["games_needed_to_win"]
+        if games_needed is not None and (
+            not isinstance(games_needed, int)
+            or isinstance(games_needed, bool)
+            or games_needed not in (1, 2, 3, 4)
+        ):
+            raise ValueError("Games needed to win must be 1, 2, 3, 4, or None.")
+
         self.player_one = player_one
         self.player_two = player_two
         self.game_config = game_config
@@ -661,6 +892,8 @@ class Match:
 
         self.server = None
         self.toss_winner = None
+        self.rating_updated = False
+        self.records_updated = False
 
     def set_server_from_toss(self):
         print(f'\nWho won the toss?')
@@ -670,37 +903,81 @@ class Match:
             choice = input("Enter 1 or 2:  ")
             if choice == '1':
                 self.toss_winner = self.player_one
-                self.server = self.player_one
                 break
 
             elif choice == '2':
                 self.toss_winner = self.player_two
-                self.server = self.player_two
                 break
             else:
                 print("Invalid input.")
 
+        while True:
+            print(f"{self.toss_winner.name}, choose:")
+            print("1. Serve first")
+            print("2. Receive first")
+            choice = input("Enter 1 or 2: ")
+            if choice == "1":
+                self.server = self.toss_winner
+                return
+            if choice == "2":
+                self.server = (
+                    self.player_two
+                    if self.toss_winner == self.player_one
+                    else self.player_one
+                )
+                return
+            print("Invalid input.")
+
     def update_server(self, game):
+        """Rebuild the next server from the game's initial server and valid points."""
+        if game.initial_server_id not in (
+            self.player_one.player_id,
+            self.player_two.player_id,
+        ):
+            raise ValueError("Game is missing a valid initial server.")
 
-        total_points = (
-            game.current_game_score[self.player_one.player_id]
-            + game.current_game_score[self.player_two.player_id]
+        undone_event_ids = {
+            event.get("undone_event_id")
+            for event in game.events
+            if event.get("type") == EVENT_UNDO
+        }
+        scores = {self.player_one.player_id: 0, self.player_two.player_id: 0}
+        server_id = game.initial_server_id
+        points_to_win = self.game_config["points_per_game"]
+        normal_interval = 2 if points_to_win == 11 else 5
+
+        for event in game.events:
+            if event.get("type") != EVENT_POINT:
+                continue
+            if event.get("event_id") in undone_event_ids:
+                continue
+            player_id = event.get("player_id")
+            if player_id not in scores:
+                raise ValueError(f"Point event has invalid player_id: {player_id}")
+
+            scores[player_id] += 1
+            total_points = scores[self.player_one.player_id] + scores[self.player_two.player_id]
+            at_deuce = (
+                scores[self.player_one.player_id] >= points_to_win - 1
+                and scores[self.player_two.player_id] >= points_to_win - 1
+            )
+            interval = 1 if at_deuce else normal_interval
+            if total_points % interval == 0:
+                server_id = (
+                    self.player_two.player_id
+                    if server_id == self.player_one.player_id
+                    else self.player_one.player_id
+                )
+
+        self.server = (
+            self.player_one
+            if server_id == self.player_one.player_id
+            else self.player_two
         )
-        points_to_win = self.game_config['points_per_game']
-        score_1 = game.current_game_score[self.player_one.player_id]
-        score_2 = game.current_game_score[self.player_one.player_id]
-
-        if score_1 >= points_to_win - 1 and score_2 >= points_to_win - 1:
-            serve_interval = 1 
-        else:
-            serve_interval = 2 if points_to_win == 11 else 5
-        if total_points % serve_interval == 0:
-            if self.server == self.player_one:
-                self.server = self.player_two
-            else:
-                self.server = self.player_one
 
     def update_games_won(self,game):
+            if game.current_game_winner is None:
+                raise ValueError("Cannot record a game without a winner.")
             winner_id = game.current_game_winner.player_id
             self.games_won[winner_id] += 1
     def check_match_finished(self):
@@ -739,6 +1016,8 @@ class EloSystem:
         elif winner == player_b:
             actual_a = 0
             actual_b = 1
+        else:
+            raise ValueError("Winner must be one of the two match players.")
         new_rating_a = rating_a + EloSystem.k_factor * (actual_a - expected_a)
         new_rating_b = rating_b + EloSystem.k_factor * (actual_b - expected_b)
 
@@ -770,7 +1049,7 @@ class rrt(Tournament):
                 match = Match(player_one=player_one,
                             player_two=player_two,
                             game_config=self.game_config,
-                            save_results=True)
+                            )
                 self.matches.append(match)
         
     def create_standings(self):
@@ -786,9 +1065,20 @@ class rrt(Tournament):
         return standings
 
     def run_tournament(self):
+        if self.finished:
+            return self.winner
+        if len(self.players) < 2:
+            raise ValueError("A round-robin tournament needs at least two players.")
+        if not self.matches:
+            self.generate_matches()
+
         for match in self.matches:
             run_match(match)
             winner = match.match_winner
+            if winner is None:
+                raise ValueError(
+                    "A tournament match ended without a winner; standings were not updated."
+                )
             loser = match.player_two if winner == match.player_one else match.player_one
 
             self.standings[winner.player_id]['wins'] += 1
@@ -818,6 +1108,8 @@ class rrt(Tournament):
         
     def get_winner(self):
         sorted_standings = self.get_sorted_standings()
+        if not sorted_standings:
+            raise ValueError("A tournament with no players has no winner.")
         return sorted_standings[0]['player']
     def print_standings(self):
         print("\nSTANDINGS:   ")
@@ -837,6 +1129,8 @@ class kot(Tournament):
         self.round_number = 1
 
     def run_round(self):
+        if len(self.current_players) < 2:
+            raise ValueError("A knockout round needs at least two players.")
 
         print(f"\nRound: {self.round_number}")
         winners = []
@@ -852,9 +1146,13 @@ class kot(Tournament):
             p1 = self.current_players[i]
             p2 = self.current_players[i+1]
 
-            match = Match(p1, p2, self.game_config, save_results=True) 
+            match = Match(p1, p2, self.game_config,) 
             self.matches.append(match)
             run_match(match)
+            if match.match_winner is None:
+                raise ValueError(
+                    "A knockout match ended without a winner; the bracket cannot advance."
+                )
             winners.append(match.match_winner)
 
         self.current_players = winners
@@ -862,6 +1160,12 @@ class kot(Tournament):
 
 
     def run(self):
+        if not self.current_players:
+            raise ValueError("A knockout tournament needs at least one player.")
+        if len(self.current_players) == 1:
+            self.finished = True
+            self.winner = self.current_players[0]
+            return
         while len(self.current_players) > 1:
             
             self.run_round()
@@ -907,3 +1211,4 @@ if __name__ == "__main__":
 
     match = Match(p1, p2, config)
     run_match(match)
+
