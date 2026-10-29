@@ -2,40 +2,62 @@
   "schema_version": 1,
   "tournament": {
     "name": "Example Open",
-    "format": "round_robin",
+    "format": "knockout",
     "game_config": {
       "points_per_game": 11,
       "deuce_enabled": true,
       "golden_point_enabled": false,
       "games_needed_to_win": 1
-    },
-    "tie_break_settings": [
-      "match_wins",
-      "game_difference",
-      "games_won"
-    ]
+    }
   },
   "entrants": [
     {
       "participant_id": "seed-1",
-      "player_id": "REPLACE_WITH_EXISTING_PLAYER_ID",
+      "player_id": "EXISTING_PLAYER_ID",
       "seed": 1
     },
     {
       "participant_id": "seed-2",
-      "player_id": "REPLACE_WITH_ANOTHER_PLAYER_ID",
+      "player_id": "ANOTHER_PLAYER_ID",
       "seed": 2
+    },
+    {
+      "participant_id": "seed-3",
+      "player_id": "THIRD_PLAYER_ID",
+      "seed": 3
+    },
+    {
+      "participant_id": "seed-4",
+      "player_id": "FOURTH_PLAYER_ID",
+      "seed": 4
     }
   ],
   "matches": [
     {
-      "match_id": "round-1-match-1",
+      "match_id": "semi-1",
       "round": 1,
       "slot": 1,
       "player_one": "seed-1",
-      "player_two": "seed-2",
+      "player_two": "seed-4",
+      "table": "Table 1"
+    },
+    {
+      "match_id": "semi-2",
+      "round": 1,
+      "slot": 2,
+      "player_one": "seed-2",
+      "player_two": "seed-3",
+      "table": "Table 2"
+    },
+    {
+      "match_id": "final",
+      "round": 2,
+      "slot": 1,
+      "winner_of": [
+        "semi-1",
+        "semi-2"
+      ],
       "table": "Table 1"
     }
   ]
-}
-
+}\n
