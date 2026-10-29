@@ -29,6 +29,7 @@ EVENT_POINT = "POINT"
 EVENT_UNDO = "UNDO_POINT"
 EVENT_FAULT = "FAULT"
 EVENT_LET = "LET"
+EVENT_FAULT_CORRECTION = "FAULT_CORRECTION"
 STATE_SCHEMA_VERSION = 1
 
 
@@ -243,6 +244,31 @@ class StorageManager:
             "matches": [match.to_dict() for match in (matches or [])],
         }
         atomic_write_json(self.state_filename, state)
+
+    def list_state_backups(self):
+        state_path = Path(self.state_filename)
+        if not state_path.parent.exists():
+            return []
+        return sorted(
+            state_path.parent.glob(state_path.name + ".backup-*"),
+            key=lambda path: path.name,
+            reverse=True,
+        )
+
+    def restore_state_backup(self, backup_path):
+        """Validate and atomically restore one backup created for this state file."""
+        state_path = Path(self.state_filename).resolve()
+        candidate = Path(backup_path).resolve()
+        expected_prefix = state_path.name + ".backup-"
+        if candidate.parent != state_path.parent or not candidate.name.startswith(expected_prefix):
+            raise ValueError("Choose a timestamped backup belonging to this state file.")
+        if not candidate.is_file():
+            raise ValueError("The selected state backup does not exist.")
+        validator = StorageManager(filename=self.filename, state_filename=str(candidate))
+        validator.load_state()
+        content = candidate.read_text(encoding="utf-8")
+        atomic_write_text(state_path, content)
+        return str(state_path)
 
     def load_state(self):
         try:
@@ -543,9 +569,15 @@ class Game:
                    initial_server=initial_server)
         game.game_id = data.get("game_id") or str(uuid.uuid4())
         game.match_id = data.get("match_id")
-        allowed_types = {EVENT_POINT, EVENT_UNDO, EVENT_FAULT, EVENT_LET}
+        allowed_types = {
+            EVENT_POINT, EVENT_UNDO, EVENT_FAULT, EVENT_LET,
+            EVENT_FAULT_CORRECTION,
+        }
         seen_ids = set()
         point_ids = set()
+        fault_ids = set()
+        faults_by_id = {}
+        undone_point_ids = set()
         for event in data["events"]:
             if not isinstance(event, dict) or event.get("type") not in allowed_types:
                 raise ValueError("Game contains an invalid event record.")
@@ -563,12 +595,30 @@ class Game:
             elif event["type"] == EVENT_UNDO:
                 if event.get("undone_event_id") not in point_ids:
                     raise ValueError("Undo event must target an earlier point event.")
+                if event.get("undone_event_id") in undone_point_ids:
+                    raise ValueError("A point cannot be undone more than once.")
+                undone_point_ids.add(event.get("undone_event_id"))
             elif event["type"] == EVENT_FAULT:
                 if event.get("point_event_id") not in point_ids:
                     raise ValueError("Fault event must reference its awarded point.")
+                if (event.get("fault_player_id") not in (player_one.player_id, player_two.player_id)
+                        or event.get("scoring_player_id") not in (player_one.player_id, player_two.player_id)):
+                    raise ValueError("Fault event references an unknown player.")
+                if event["fault_player_id"] == event["scoring_player_id"]:
+                    raise ValueError("A fault point must be awarded to the other player.")
+                fault_ids.add(event_id)
+                faults_by_id[event_id] = event
             elif event["type"] == EVENT_LET:
                 if event.get("server_id") not in (player_one.player_id, player_two.player_id):
                     raise ValueError("Let event references an unknown server.")
+            elif event["type"] == EVENT_FAULT_CORRECTION:
+                if event.get("fault_event_id") not in fault_ids:
+                    raise ValueError("Fault correction must target an earlier fault event.")
+                if event.get("point_event_id") != faults_by_id[event["fault_event_id"]].get("point_event_id"):
+                    raise ValueError("Fault correction must reference the point awarded for its fault.")
+                new_scorer = event.get("new_scoring_player_id")
+                if new_scorer is not None and new_scorer not in (player_one.player_id, player_two.player_id):
+                    raise ValueError("Fault correction references an unknown scoring player.")
         game.events = copy.deepcopy(data["events"])
         for event in game.events:
             if event.get("match_id") not in (None, game.match_id):
@@ -583,23 +633,114 @@ class Game:
         self.current_game_score[self.player_one.player_id] = 0
         self.current_game_score[self.player_two.player_id] = 0
 
-        undone_event_ids = {
-            event['undone_event_id']
-            for event in self.events
-            if event.get('type') == EVENT_UNDO
-            and 'undone_event_id' in event
-        }
-
-        for event in self.events:
-            if event.get('type') != EVENT_POINT:
-                continue
-            if event.get('event_id') in undone_event_ids:
-                continue
-            player_id = event.get('player_id')
+        for event in self.iter_valid_point_events():
+            player_id = event["player_id"]
             if player_id not in self.current_game_score:
                 raise ValueError(f'Point event has invalid player id: {player_id}')
-
             self.current_game_score[player_id] += 1
+
+    def iter_valid_point_events(self):
+        """Replay awarded points after undo and fault-correction events."""
+        undone_ids = {
+            event.get("undone_event_id") for event in self.events
+            if event.get("type") == EVENT_UNDO
+        }
+        faults_by_point = {}
+        for event in self.events:
+            if event.get("type") == EVENT_FAULT:
+                faults_by_point[event.get("point_event_id")] = event
+        latest_correction = {}
+        for event in self.events:
+            if event.get("type") == EVENT_FAULT_CORRECTION:
+                latest_correction[event.get("fault_event_id")] = event
+        score = {self.player_one.player_id: 0, self.player_two.player_id: 0}
+        server_id = self.initial_server_id
+        normal_interval = 2 if self.game_config["points_per_game"] == 11 else 5
+        for event in self.events:
+            if event.get("type") != EVENT_POINT or event.get("event_id") in undone_ids:
+                continue
+            fault = faults_by_point.get(event.get("event_id"))
+            correction = latest_correction.get(fault.get("event_id")) if fault else None
+            if correction is not None:
+                corrected_scorer = correction.get("new_scoring_player_id")
+                if corrected_scorer is None:
+                    continue
+                effective = dict(event)
+                effective["player_id"] = corrected_scorer
+            else:
+                effective = dict(event)
+            if effective.get("server_id") is None:
+                effective["server_id"] = server_id
+            scorer_id = effective["player_id"]
+            if scorer_id not in score:
+                raise ValueError(f"Point event has invalid player ID: {scorer_id}")
+            yield effective
+            score[scorer_id] += 1
+            total = score[self.player_one.player_id] + score[self.player_two.player_id]
+            at_deuce = (
+                score[self.player_one.player_id] >= self.game_config["points_per_game"] - 1
+                and score[self.player_two.player_id] >= self.game_config["points_per_game"] - 1
+            )
+            interval = 1 if at_deuce else normal_interval
+            if server_id in score and total % interval == 0:
+                server_id = (
+                    self.player_two.player_id
+                    if server_id == self.player_one.player_id
+                    else self.player_one.player_id
+                )
+
+    def server_id_for_next_point(self):
+        """Return the server for the next point, derived from the valid point stream."""
+        server_id = self.initial_server_id
+        if server_id not in (self.player_one.player_id, self.player_two.player_id):
+            return None
+        points_to_win = self.game_config["points_per_game"]
+        normal_interval = 2 if points_to_win == 11 else 5
+        score = {self.player_one.player_id: 0, self.player_two.player_id: 0}
+        for event in self.iter_valid_point_events():
+            score[event["player_id"]] += 1
+            total = score[self.player_one.player_id] + score[self.player_two.player_id]
+            at_deuce = (
+                score[self.player_one.player_id] >= points_to_win - 1
+                and score[self.player_two.player_id] >= points_to_win - 1
+            )
+            interval = 1 if at_deuce else normal_interval
+            if total % interval == 0:
+                server_id = (
+                    self.player_two.player_id
+                    if server_id == self.player_one.player_id
+                    else self.player_one.player_id
+                )
+        return server_id
+
+    def correct_fault(self, fault_event_id, reason, new_scoring_player_id=None):
+        """Correct a fault explicitly; None removes its point award."""
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("A reason is required to correct a fault.")
+        fault = next((event for event in self.events
+                      if event.get("type") == EVENT_FAULT
+                      and event.get("event_id") == fault_event_id), None)
+        if fault is None:
+            raise ValueError(f"Unknown fault event ID: {fault_event_id}")
+        if new_scoring_player_id is not None and new_scoring_player_id not in (
+            self.player_one.player_id, self.player_two.player_id
+        ):
+            raise ValueError("Corrected point winner must be one of the game players or None.")
+        self.events.append({
+            "type": EVENT_FAULT_CORRECTION,
+            "event_id": str(uuid.uuid4()),
+            "timestamp": utc_now_iso(),
+            "match_id": self.match_id,
+            "game_id": self.game_id,
+            "fault_event_id": fault_event_id,
+            "point_event_id": fault.get("point_event_id"),
+            "new_scoring_player_id": new_scoring_player_id,
+            "reason": reason.strip(),
+        })
+        self.recalculate_current_game_score()
+        self.current_game_finished = False
+        self.current_game_winner = None
+        self.check_game_finished()
 
 
     def add_point(self, scoring_player, server_id=None):
@@ -608,6 +749,11 @@ class Game:
             return
         if scoring_player not in (self.player_one, self.player_two):
             raise ValueError("Scoring player must be one of the players in this game.")
+        server_id = server_id or self.server_id_for_next_point()
+        if server_id is not None and server_id not in (
+            self.player_one.player_id, self.player_two.player_id
+        ):
+            raise ValueError("Server must be one of the players in this game.")
         #while self.current_game_finished == False:
         
             #point_winner = input("Point Winner (1/2):  ")
@@ -644,6 +790,11 @@ class Game:
         else:
             print("Invalid input.")
             return
+        server_id = server_id or self.server_id_for_next_point()
+        if server_id is not None and server_id not in (
+            self.player_one.player_id, self.player_two.player_id
+        ):
+            raise ValueError("Server must be one of the players in this game.")
         point_event = {
                     "type": EVENT_POINT,
                     'event_id':str(uuid.uuid4()),
@@ -748,18 +899,17 @@ class Game:
 
 
     def undo_last_point(self, reason):
-            undone_event_ids = {
-                event['undone_event_id']
-                for event in self.events
-                if event['type'] == EVENT_UNDO
-                and 'undone_event_id' in event  #set comprehension
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError("A reason is required to undo a point.")
+            valid_point_ids = {
+                event["event_id"] for event in self.iter_valid_point_events()
             }
 
             last_point = None
             for event in reversed(self.events):
                 if event['type'] != EVENT_POINT:
                     continue
-                if event.get('event_id') in undone_event_ids:
+                if event.get('event_id') not in valid_point_ids:
                     continue
                 last_point = event
                 break
@@ -864,7 +1014,7 @@ def score_check(game):
     print("1 -", game.player_one.name)
     print("2 -", game.player_two.name)
 
-    choice = input("Enter choice (1-5): ")
+    choice = input("Enter choice (1-6): ")
 
         if choice == "1":
             engine.add_point(player_one)
@@ -883,6 +1033,7 @@ def input_point_winner(game,match):
     print("3 - Fault")
     print("4 - Let")
     print("5 - Undo")
+    print("6 - Correct a previously recorded fault")
 
     choice = input("Enter choice (1-5): ")
     if choice == "1":
@@ -920,6 +1071,32 @@ def input_point_winner(game,match):
         game.undo_last_point(reason)
         match.update_server(game)
 
+    elif choice == "6":
+        faults = [event for event in game.events if event.get("type") == EVENT_FAULT]
+        if not faults:
+            print("This game has no recorded faults to correct.")
+            return
+        for index, event in enumerate(faults, start=1):
+            print(f"{index}. Fault event {event['event_id']} — {event['fault_player_id']}")
+        selected = input("Fault number: ").strip()
+        if not selected.isdigit() or not 1 <= int(selected) <= len(faults):
+            print("Choose a listed fault number.")
+            return
+        print("Corrected outcome: 1/2 awards the point to that player; 3 removes the point.")
+        outcome = input("Enter 1, 2, or 3: ").strip()
+        if outcome == "1":
+            corrected_scorer = game.player_one.player_id
+        elif outcome == "2":
+            corrected_scorer = game.player_two.player_id
+        elif outcome == "3":
+            corrected_scorer = None
+        else:
+            print("Choose 1, 2, or 3.")
+            return
+        reason = input("Reason for correction: ")
+        game.correct_fault(faults[int(selected) - 1]["event_id"], reason, corrected_scorer)
+        match.update_server(game)
+
     else:
         print("Invalid input. Try again.")
 
@@ -952,12 +1129,7 @@ def run_match(match):
             if match.server is None:
                 match.set_server_from_toss()
             elif match.games:
-                previous_first_server_id = match.games[-1].initial_server_id
-                match.server = (
-                    match.player_two
-                    if previous_first_server_id == match.player_one.player_id
-                    else match.player_one
-                )
+                match.server = match.next_game_server()
             game = match.create_game(match.server)
         print(f"\n{match.server.name} is serving to start the game.")
         while True:
@@ -1032,17 +1204,8 @@ def run_match(match):
                 match.player_two.player_id: 0,
             }
             for completed_game in match.games:
-                undone_event_ids = {
-                    event.get("undone_event_id")
-                    for event in completed_game.events
-                    if event.get("type") == EVENT_UNDO
-                }
-                for event in completed_game.events:
-                    if (
-                        event.get("type") == EVENT_POINT
-                        and event.get("event_id") not in undone_event_ids
-                        and event.get("player_id") in point_counts
-                    ):
+                for event in completed_game.iter_valid_point_events():
+                    if event.get("player_id") in point_counts:
                         point_counts[event["player_id"]] += 1
 
             p1 = match.player_one
@@ -1158,6 +1321,17 @@ class Match:
         self.notify_state_change()
         return game
 
+    def next_game_server(self):
+        """Return the opening server for a new game, alternating from the last game."""
+        if not self.games:
+            return self.server
+        previous_server_id = self.games[-1].initial_server_id
+        if previous_server_id == self.player_one.player_id:
+            return self.player_two
+        if previous_server_id == self.player_two.player_id:
+            return self.player_one
+        raise ValueError("The previous game has no valid initial server.")
+
     def to_dict(self):
         games = []
         for game in self.games:
@@ -1205,7 +1379,10 @@ class Match:
         if player_one is None or player_two is None:
             raise ValueError("Match record references unknown players.")
         match = cls(player_one, player_two, data.get("game_config"))
-        match.match_id = data.get("match_id") or str(uuid.uuid4())
+        match_id = data.get("match_id")
+        if match_id is not None and (not isinstance(match_id, str) or not match_id):
+            raise ValueError("Match ID must be a non-empty string.")
+        match.match_id = match_id or str(uuid.uuid4())
         match.created_at = data.get("created_at", utc_now_iso())
         match.completed_at = data.get("completed_at")
         allowed_statuses = {
@@ -1216,10 +1393,25 @@ class Match:
         if status not in allowed_statuses:
             raise ValueError(f"Invalid match status: {status!r}")
         match.status = status
+        game_rows = data.get("games", [])
+        if not isinstance(game_rows, list):
+            raise ValueError("Match games field must be a list.")
+        expected_player_ids = {player_one.player_id, player_two.player_id}
+        for game_row in game_rows:
+            if (not isinstance(game_row, dict)
+                    or {game_row.get("player_one_id"), game_row.get("player_two_id")}
+                    != expected_player_ids):
+                raise ValueError("Game record players do not match the parent match.")
         match.games = [Game.from_dict(item, players, match.game_config)
-                       for item in data.get("games", [])]
+                       for item in game_rows]
+        if any(game.current_game_winner is None for game in match.games):
+            raise ValueError("Completed-game history contains a game without a winner.")
         current_game_data = data.get("current_game")
         if current_game_data is not None:
+            if (not isinstance(current_game_data, dict)
+                    or {current_game_data.get("player_one_id"), current_game_data.get("player_two_id")}
+                    != expected_player_ids):
+                raise ValueError("Current-game players do not match the parent match.")
             match.current_game = Game.from_dict(
                 current_game_data, players, match.game_config
             )
@@ -1246,6 +1438,10 @@ class Match:
         match.match_finished = bool(data.get("match_finished", False))
         match.server = players.get(data.get("server_id"))
         match.toss_winner = players.get(data.get("toss_winner_id"))
+        if data.get("server_id") is not None and match.server not in (player_one, player_two):
+            raise ValueError("Match server ID is not one of the match players.")
+        if data.get("toss_winner_id") is not None and match.toss_winner not in (player_one, player_two):
+            raise ValueError("Toss winner ID is not one of the match players.")
         match.round_number = data.get("round_number")
         match.slot_number = data.get("slot_number")
         match.table_assignment = data.get("table_assignment")
@@ -1253,6 +1449,22 @@ class Match:
         match.rating_updated = bool(data.get("rating_updated", False))
         match.rating_before = copy.deepcopy(data.get("rating_before"))
         match.records_updated = bool(data.get("records_updated", False))
+        if match.rating_before is not None:
+            if (not isinstance(match.rating_before, dict)
+                    or set(match.rating_before) != expected_player_ids
+                    or any(not isinstance(value, int) or isinstance(value, bool)
+                           for value in match.rating_before.values())):
+                raise ValueError("Match rating_before must contain integer ratings for both players.")
+        terminal_status = status in {"completed", "walkover", "retired"}
+        if match.match_finished != terminal_status:
+            raise ValueError("Match status and match_finished flag are inconsistent.")
+        if match.match_winner is not None and not match.match_finished:
+            raise ValueError("An unfinished match cannot contain a winner.")
+        if status in {"walkover", "retired"} and match.match_winner is None:
+            raise ValueError("Walkover and retired matches must record a winner.")
+        if (status == "completed" and match.match_winner is None
+                and match.game_config["games_needed_to_win"] is not None):
+            raise ValueError("A completed finite-length match must record a winner.")
         return match
 
     def set_server_from_toss(self):
@@ -1290,45 +1502,9 @@ class Match:
 
     def update_server(self, game):
         """Rebuild the next server from the game's initial server and valid points."""
-        if game.initial_server_id not in (
-            self.player_one.player_id,
-            self.player_two.player_id,
-        ):
+        server_id = game.server_id_for_next_point()
+        if server_id is None:
             raise ValueError("Game is missing a valid initial server.")
-
-        undone_event_ids = {
-            event.get("undone_event_id")
-            for event in game.events
-            if event.get("type") == EVENT_UNDO
-        }
-        scores = {self.player_one.player_id: 0, self.player_two.player_id: 0}
-        server_id = game.initial_server_id
-        points_to_win = self.game_config["points_per_game"]
-        normal_interval = 2 if points_to_win == 11 else 5
-
-        for event in game.events:
-            if event.get("type") != EVENT_POINT:
-                continue
-            if event.get("event_id") in undone_event_ids:
-                continue
-            player_id = event.get("player_id")
-            if player_id not in scores:
-                raise ValueError(f"Point event has invalid player_id: {player_id}")
-
-            scores[player_id] += 1
-            total_points = scores[self.player_one.player_id] + scores[self.player_two.player_id]
-            at_deuce = (
-                scores[self.player_one.player_id] >= points_to_win - 1
-                and scores[self.player_two.player_id] >= points_to_win - 1
-            )
-            interval = 1 if at_deuce else normal_interval
-            if total_points % interval == 0:
-                server_id = (
-                    self.player_two.player_id
-                    if server_id == self.player_one.player_id
-                    else self.player_one.player_id
-                )
-
         self.server = (
             self.player_one
             if server_id == self.player_one.player_id
@@ -1447,7 +1623,7 @@ class Tournament:
             raise ValueError(f"Unknown entrant ID: {player_id}")
         affected = [match for match in self.matches
                     if player_id in (match.player_one.player_id, match.player_two.player_id)]
-        if any(match.status == "in_progress" for match in affected):
+        if any(match.status == "in_progress" or match.current_game is not None for match in affected):
             raise ValueError("Finish or explicitly correct in-progress matches before withdrawing an entrant.")
         previous_matches = []
         for match in affected:
@@ -1455,11 +1631,19 @@ class Tournament:
             if match.status == "scheduled":
                 match.status = "cancelled"
                 match.match_finished = False
+        previous_current_ids = (
+            [item.player_id for item in self.current_players]
+            if isinstance(self, kot) else None
+        )
         self.players.remove(player)
+        if isinstance(self, kot):
+            self.current_players = [item for item in self.current_players
+                                    if item.player_id != player_id]
         previous_seed = self.seeds.pop(player_id, None)
         self.record_change("remove_entrant", "player", player_id,
                            {"player": player.to_dict(), "seed": previous_seed,
-                            "affected_matches": previous_matches}, None, reason)
+                            "affected_matches": previous_matches,
+                            "current_player_ids": previous_current_ids}, None, reason)
         if isinstance(self, rrt):
             self.recalculate_standings()
         return player
@@ -1475,9 +1659,22 @@ class Tournament:
                     if old_player_id in (match.player_one.player_id, match.player_two.player_id)]
         if any(match.status == "in_progress" or match.current_game is not None for match in affected):
             raise ValueError("Pause or finish in-progress matches before replacing an entrant.")
+        if isinstance(self, kot) and (
+            any(match.games or match.match_finished for match in affected)
+            or any(row.get("completed") for row in self.draw_metadata.get("rounds", []))
+        ):
+            raise ValueError(
+                "A knockout entrant cannot be replaced after bracket results have been recorded; "
+                "correct or rebuild the bracket first."
+            )
         index = self.players.index(old_player)
         old_seed = self.seeds.pop(old_player_id, None)
         self.players[index] = new_player
+        if isinstance(self, kot):
+            self.current_players = [
+                new_player if item.player_id == old_player_id else item
+                for item in self.current_players
+            ]
         self.seeds[new_player.player_id] = old_seed
         replacements = []
         for match in affected:
@@ -1502,6 +1699,25 @@ class Tournament:
         if isinstance(self, rrt):
             self.generate_matches()
             self.recalculate_standings()
+        elif isinstance(self, kot):
+            for row in self.draw_metadata.get("rounds", []):
+                row["entrant_ids"] = [
+                    new_player.player_id if player_id == old_player_id else player_id
+                    for player_id in row.get("entrant_ids", [])
+                ]
+                row["bye_player_ids"] = [
+                    new_player.player_id if player_id == old_player_id else player_id
+                    for player_id in row.get("bye_player_ids", [])
+                ]
+                if row.get("bye_player_id") == old_player_id:
+                    row["bye_player_id"] = new_player.player_id
+            for bye in self.draw_metadata.get("byes", []):
+                if bye.get("player_id") == old_player_id:
+                    bye["player_id"] = new_player.player_id
+            for plan in self.draw_metadata.get("match_plans", []):
+                for key in ("player_one_id", "player_two_id"):
+                    if plan.get(key) == old_player_id:
+                        plan[key] = new_player.player_id
         self.record_change("replace_entrant", "player", old_player_id,
                            {"old": old_player.to_dict(), "replacement": new_player.to_dict(),
                             "superseded_matches": replacements},
@@ -1618,15 +1834,12 @@ class Tournament:
         if match.rating_updated and match.rating_before:
             match.player_one.elo_rating = match.rating_before[match.player_one.player_id]
             match.player_two.elo_rating = match.rating_before[match.player_two.player_id]
-        if previous.get("status") != "walkover":
-            match.rating_before = {
-                match.player_one.player_id: match.player_one.elo_rating,
-                match.player_two.player_id: match.player_two.elo_rating,
-            }
-            EloSystem.update_score(match.player_one, match.player_two, winner)
-            match.rating_updated = True
-        else:
-            match.rating_updated = False
+        match.rating_before = {
+            match.player_one.player_id: match.player_one.elo_rating,
+            match.player_two.player_id: match.player_two.elo_rating,
+        }
+        EloSystem.update_score(match.player_one, match.player_two, winner)
+        match.rating_updated = True
         match.match_winner = winner
         match.match_finished = True
         match.status = "completed"
@@ -1700,11 +1913,41 @@ class Tournament:
             raise ValueError("Completed, walkover, and retired matches require a winner.")
         previous = {"status": match.status,
                     "winner_id": match.match_winner.player_id if match.match_winner else None}
+        old_winner = match.match_winner
+        was_finished = match.match_finished and old_winner is not None
+        will_finish = status in {"completed", "walkover", "retired"}
+        if match.records_updated and old_winner is not None and (
+            not will_finish or old_winner != winner
+        ):
+            old_loser = match.player_two if old_winner == match.player_one else match.player_one
+            old_winner.matches_won = max(0, old_winner.matches_won - 1)
+            old_loser.matches_lost = max(0, old_loser.matches_lost - 1)
+            match.records_updated = False
+        if match.rating_updated and match.rating_before and (
+            not will_finish or status == "walkover" or old_winner != winner
+        ):
+            match.player_one.elo_rating = match.rating_before[match.player_one.player_id]
+            match.player_two.elo_rating = match.rating_before[match.player_two.player_id]
+            match.rating_updated = False
         match.status = status
         match.match_winner = winner
-        match.match_finished = status in {"completed", "walkover", "retired"}
+        match.match_finished = will_finish
         if match.match_finished:
             match.completed_at = utc_now_iso()
+            if not match.records_updated:
+                winner.matches_won += 1
+                loser = match.player_two if winner == match.player_one else match.player_one
+                loser.matches_lost += 1
+                match.records_updated = True
+            if status != "walkover" and not match.rating_updated:
+                match.rating_before = {
+                    match.player_one.player_id: match.player_one.elo_rating,
+                    match.player_two.player_id: match.player_two.elo_rating,
+                }
+                EloSystem.update_score(match.player_one, match.player_two, winner)
+                match.rating_updated = True
+        else:
+            match.completed_at = None
         match.manually_overridden = True
         if isinstance(self, rrt):
             self.recalculate_standings()
@@ -1815,13 +2058,7 @@ class rrt(Tournament):
             lose_entry["games_won"] += match.games_won.get(loser.player_id, 0)
             lose_entry["games_lost"] += match.games_won.get(winner.player_id, 0)
             for game in match.games:
-                undone_ids = {
-                    event.get("undone_event_id") for event in game.events
-                    if event.get("type") == EVENT_UNDO
-                }
-                for event in game.events:
-                    if event.get("type") != EVENT_POINT or event.get("event_id") in undone_ids:
-                        continue
+                for event in game.iter_valid_point_events():
                     scorer_id = event.get("player_id")
                     if scorer_id == winner.player_id:
                         win_entry["points_for"] += 1
@@ -1841,6 +2078,18 @@ class rrt(Tournament):
             self.generate_matches()
 
         for match in self.matches:
+            if match.status == "cancelled":
+                active_ids = {player.player_id for player in self.players}
+                if {match.player_one.player_id, match.player_two.player_id}.issubset(active_ids):
+                    raise RuntimeError(
+                        f"Cancelled match {match.match_id} still has two active entrants; "
+                        "reschedule it or withdraw an entrant before completing the tournament."
+                    )
+                continue
+            if match.status == "postponed":
+                raise RuntimeError(
+                    f"Match {match.match_id} is postponed; reschedule or cancel it before completing the tournament."
+                )
             run_match(match)
             winner = match.match_winner
             if winner is None:
@@ -1917,6 +2166,63 @@ class kot(Tournament):
         self.current_players = players[:] #creates copy of the list
         self.round_number = 1
 
+    def _materialize_planned_round(self, round_number):
+        plans = [row for row in self.draw_metadata.get("match_plans", [])
+                 if row.get("round") == round_number]
+        if not plans:
+            return None
+
+        matches_by_id = {match.match_id: match for match in self.matches}
+        byes_by_id = {
+            row["match_id"]: row["player_id"]
+            for row in self.draw_metadata.get("byes", [])
+            if row.get("round") == round_number - 1
+        }
+        materialized = []
+        entrant_ids = []
+        for plan in sorted(plans, key=lambda row: row["slot"]):
+            selected_players = []
+            for source_id in plan["winner_of"]:
+                source_match = matches_by_id.get(source_id)
+                if source_match is not None:
+                    if not source_match.match_finished or source_match.match_winner is None:
+                        raise RuntimeError(
+                            f"Knockout match {plan['match_id']} awaits the result of {source_id}."
+                        )
+                    player = source_match.match_winner
+                else:
+                    player_id = byes_by_id.get(source_id)
+                    player = next((p for p in self.players if p.player_id == player_id), None)
+                    if player is None:
+                        raise ValueError(
+                            f"Knockout plan {plan['match_id']} references an unknown or withdrawn bye."
+                        )
+                selected_players.append(player)
+            if selected_players[0] == selected_players[1]:
+                raise ValueError(
+                    f"Knockout plan {plan['match_id']} resolves to the same player twice."
+                )
+            match = Match(selected_players[0], selected_players[1], self.game_config)
+            match.match_id = plan["match_id"]
+            match.round_number = round_number
+            match.slot_number = plan["slot"]
+            match.table_assignment = plan.get("table")
+            match._on_change = self._on_change
+            self.matches.append(match)
+            materialized.append(match)
+            entrant_ids.extend(player.player_id for player in selected_players)
+
+        record = {
+            "round": round_number,
+            "entrant_ids": list(dict.fromkeys(entrant_ids)),
+            "bye_player_id": None,
+            "bye_player_ids": [],
+            "bye_match_ids": [],
+            "match_ids": [match.match_id for match in materialized],
+            "completed": False,
+        }
+        return record, materialized
+
     def run_round(self):
         if self.automatic_progression_paused:
             raise RuntimeError("Automatic progression is paused; resume it or advance matches manually.")
@@ -1928,29 +2234,38 @@ class kot(Tournament):
         round_record = next(
             (row for row in rounds if row.get("round") == self.round_number), None
         )
+        if round_record is not None and round_record.get("completed"):
+            raise ValueError(f"Knockout round {self.round_number} is already complete.")
         if round_record is None:
-            round_record = {
-                "round": self.round_number,
-                "entrant_ids": [player.player_id for player in self.current_players],
-                "bye_player_id": None,
-                "match_ids": [],
-                "completed": False,
-            }
-            remaining = list(self.current_players)
-            if len(remaining) % 2 == 1:
-                bye_player = random.choice(remaining)
-                remaining.remove(bye_player)
-                round_record["bye_player_id"] = bye_player.player_id
-                print(f"{bye_player.name.title()} gets a bye.")
-            round_matches = []
-            for index in range(0, len(remaining), 2):
-                match = Match(remaining[index], remaining[index + 1], self.game_config)
-                match._on_change = self._on_change
-                match.round_number = self.round_number
-                match.slot_number = index // 2 + 1
-                self.matches.append(match)
-                round_matches.append(match)
-                round_record["match_ids"].append(match.match_id)
+            planned_round = self._materialize_planned_round(self.round_number)
+            if planned_round is not None:
+                round_record, round_matches = planned_round
+            else:
+                round_record = {
+                    "round": self.round_number,
+                    "entrant_ids": [player.player_id for player in self.current_players],
+                    "bye_player_id": None,
+                    "bye_player_ids": [],
+                    "bye_match_ids": [],
+                    "match_ids": [],
+                    "completed": False,
+                }
+                remaining = list(self.current_players)
+                if len(remaining) % 2 == 1:
+                    bye_player = random.choice(remaining)
+                    remaining.remove(bye_player)
+                    round_record["bye_player_id"] = bye_player.player_id
+                    round_record["bye_player_ids"].append(bye_player.player_id)
+                    print(f"{bye_player.name.title()} gets a bye.")
+                round_matches = []
+                for index in range(0, len(remaining), 2):
+                    match = Match(remaining[index], remaining[index + 1], self.game_config)
+                    match._on_change = self._on_change
+                    match.round_number = self.round_number
+                    match.slot_number = index // 2 + 1
+                    self.matches.append(match)
+                    round_matches.append(match)
+                    round_record["match_ids"].append(match.match_id)
             rounds.append(round_record)
             if self._on_change is not None:
                 self._on_change()
@@ -1961,17 +2276,22 @@ class kot(Tournament):
             round_matches = [match_map[match_id] for match_id in round_record["match_ids"]]
 
         winners = []
-        bye_id = round_record.get("bye_player_id")
-        if bye_id:
+        bye_ids = round_record.get("bye_player_ids") or (
+            [round_record["bye_player_id"]] if round_record.get("bye_player_id") else []
+        )
+        for bye_id in bye_ids:
             bye_player = next((player for player in self.players if player.player_id == bye_id), None)
-            if bye_player is None:
-                raise ValueError("Saved knockout bye references an unknown player.")
-            winners.append(bye_player)
+            if bye_player is not None:
+                winners.append(bye_player)
 
         for match in round_matches:
             if match.match_finished and match.match_winner is not None:
                 winners.append(match.match_winner)
                 continue
+            if match.status in {"cancelled", "postponed"}:
+                raise RuntimeError(
+                    f"Match {match.match_id} is {match.status}; manually advance the round or reschedule it."
+                )
             run_match(match)
             if match.match_winner is None:
                 raise ValueError(
@@ -1984,6 +2304,70 @@ class kot(Tournament):
         self.round_number += 1
         if self._on_change is not None:
             self._on_change()
+
+    def advance_round_manually(self, winner_ids_by_match, reason):
+        """Advance an interrupted knockout round from explicit organizer decisions."""
+        self._require_reason(reason)
+        rounds = self.draw_metadata.get("rounds", [])
+        round_record = next(
+            (row for row in rounds if row.get("round") == self.round_number), None
+        )
+        if round_record is None or round_record.get("completed"):
+            raise ValueError("There is no incomplete knockout round to advance.")
+        match_map = {match.match_id: match for match in self.matches}
+        round_matches = []
+        for match_id in round_record.get("match_ids", []):
+            match = match_map.get(match_id)
+            if match is None:
+                raise ValueError(f"Saved knockout round references missing match {match_id!r}.")
+            round_matches.append(match)
+        if not isinstance(winner_ids_by_match, dict):
+            raise ValueError("Provide a match-ID to winner-ID mapping for the round.")
+        expected_ids = {match.match_id for match in round_matches}
+        if set(winner_ids_by_match) != expected_ids:
+            raise ValueError("Choose exactly one winner for every match in the incomplete round.")
+
+        winners = []
+        bye_ids = round_record.get("bye_player_ids") or (
+            [round_record["bye_player_id"]] if round_record.get("bye_player_id") else []
+        )
+        for bye_id in bye_ids:
+            bye_player = next((p for p in self.players if p.player_id == bye_id), None)
+            if bye_player is not None:
+                winners.append(bye_player)
+        decisions = []
+        for match in round_matches:
+            winner_id = winner_ids_by_match[match.match_id]
+            winner = next((p for p in (match.player_one, match.player_two)
+                           if p.player_id == winner_id), None)
+            if winner is None:
+                raise ValueError(f"Winner for match {match.match_id} must be one of its players.")
+            if not any(p.player_id == winner.player_id for p in self.players):
+                raise ValueError("A withdrawn player cannot advance from the knockout round.")
+            if match.match_finished and match.match_winner not in (None, winner):
+                raise ValueError(
+                    f"Match {match.match_id} already has another recorded winner; correct its result first."
+                )
+            if not match.match_finished or not match.records_updated:
+                self.set_match_status(
+                    match.match_id,
+                    "walkover" if not match.match_finished else match.status,
+                    reason,
+                    winner_id=winner.player_id,
+                )
+            winners.append(winner)
+            decisions.append({"match_id": match.match_id, "winner_id": winner.player_id})
+
+        self.current_players = winners
+        round_record["completed"] = True
+        self.round_number += 1
+        self.record_change(
+            "advance_knockout_round", "round", round_record["round"], None,
+            {"winners": [player.player_id for player in winners], "decisions": decisions}, reason,
+        )
+        if self._on_change is not None:
+            self._on_change()
+        return winners
 
     def to_dict(self):
         data = super().to_dict()
@@ -2001,6 +2385,14 @@ class kot(Tournament):
         if not self.current_players:
             raise ValueError("A knockout tournament needs at least one player.")
         if len(self.current_players) == 1:
+            incomplete = any(
+                not row.get("completed") and row.get("round") == self.round_number
+                for row in self.draw_metadata.get("rounds", [])
+            )
+            if incomplete:
+                raise RuntimeError(
+                    "An incomplete knockout round needs manual advancement before declaring a winner."
+                )
             self.finished = True
             self.winner = self.current_players[0]
             if self._on_change is not None:
@@ -2068,15 +2460,9 @@ class StatisticsService:
                         stats["games_won"] += 1
                     else:
                         stats["games_lost"] += 1
-                undone_ids = {
-                    event.get("undone_event_id") for event in game.events
-                    if event.get("type") == EVENT_UNDO
-                }
                 score = {match.player_one.player_id: 0, match.player_two.player_id: 0}
                 deuce_reached = False
-                for event in game.events:
-                    if event.get("type") != EVENT_POINT or event.get("event_id") in undone_ids:
-                        continue
+                for event in game.iter_valid_point_events():
                     scorer_id = event.get("player_id")
                     if scorer_id not in score:
                         continue
@@ -2101,10 +2487,8 @@ class StatisticsService:
                     if game.current_game_winner is not None and game.current_game_winner.player_id == player_id:
                         stats["deuce_games_won"] += 1
                 opponent_row["points_won"] += sum(
-                    1 for event in game.events
-                    if event.get("type") == EVENT_POINT
-                    and event.get("event_id") not in undone_ids
-                    and event.get("player_id") == player_id
+                    1 for event in game.iter_valid_point_events()
+                    if event.get("player_id") == player_id
                 )
 
         total_points = stats["points_won"] + stats["points_lost"]
@@ -2136,31 +2520,45 @@ class TournamentDrawService:
             "schema_version": 1,
             "tournament": {
                 "name": "Example Open",
-                "format": "round_robin",
+                "format": "knockout",
                 "game_config": {
                     "points_per_game": 11,
                     "deuce_enabled": True,
                     "golden_point_enabled": False,
                     "games_needed_to_win": 1,
                 },
-                "tie_break_settings": ["match_wins", "game_difference", "games_won"],
             },
             "entrants": [
                 {"participant_id": "seed-1", "player_id": "EXISTING_PLAYER_ID", "seed": 1},
                 {"participant_id": "seed-2", "player_id": "ANOTHER_PLAYER_ID", "seed": 2},
+                {"participant_id": "seed-3", "player_id": "THIRD_PLAYER_ID", "seed": 3},
+                {"participant_id": "seed-4", "player_id": "FOURTH_PLAYER_ID", "seed": 4},
             ],
             "matches": [
-                {"match_id": "round-1-match-1", "round": 1, "slot": 1,
-                 "player_one": "seed-1", "player_two": "seed-2", "table": "Table 1"}
+                {"match_id": "semi-1", "round": 1, "slot": 1,
+                 "player_one": "seed-1", "player_two": "seed-4", "table": "Table 1"},
+                {"match_id": "semi-2", "round": 1, "slot": 2,
+                 "player_one": "seed-2", "player_two": "seed-3", "table": "Table 2"},
+                {"match_id": "final", "round": 2, "slot": 1,
+                 "winner_of": ["semi-1", "semi-2"], "table": "Table 1"},
             ],
         }
 
     @classmethod
-    def preview_json(cls, source, players):
-        players_by_id = (
-            players if isinstance(players, dict)
-            else {player.player_id: player for player in players}
-        )
+    def preview_json(cls, source, players, player_mapping=None):
+        try:
+            players_by_id = (
+                dict(players) if isinstance(players, dict)
+                else {player.player_id: player for player in players}
+            )
+        except (TypeError, AttributeError):
+            return {"valid": False, "errors": ["players must be a collection of player records."], "warnings": []}
+        if any(
+            not isinstance(player_id, str) or not player_id
+            or not isinstance(getattr(player, "name", None), str)
+            for player_id, player in players_by_id.items()
+        ):
+            return {"valid": False, "errors": ["players contains an invalid ID or player record."], "warnings": []}
         if isinstance(source, str):
             try:
                 source = json.loads(source)
@@ -2168,17 +2566,24 @@ class TournamentDrawService:
                 return {"valid": False, "errors": [f"Invalid JSON: {error}"], "warnings": []}
         errors = []
         warnings = []
+        mapping = player_mapping or {}
+        if not isinstance(mapping, dict):
+            return {"valid": False, "errors": ["player_mapping must be an object."], "warnings": []}
         if not isinstance(source, dict):
             return {"valid": False, "errors": ["Draw must be a JSON object."], "warnings": []}
-        if source.get("schema_version") != 1:
+        if (source.get("schema_version") != 1
+                or isinstance(source.get("schema_version"), bool)):
             errors.append("schema_version must be 1.")
         details = source.get("tournament")
         if not isinstance(details, dict):
             details = {}
             errors.append("tournament must be an object.")
         format_name = details.get("format")
-        if format_name not in {"round_robin", "knockout"}:
+        if format_name not in ("round_robin", "knockout"):
             errors.append("tournament.format must be 'round_robin' or 'knockout'.")
+        tournament_name = details.get("name", "Unnamed tournament")
+        if not isinstance(tournament_name, str) or not tournament_name.strip():
+            errors.append("tournament.name must be a non-empty string.")
         entrant_rows = source.get("entrants")
         if not isinstance(entrant_rows, list) or not entrant_rows:
             entrant_rows = []
@@ -2202,6 +2607,14 @@ class TournamentDrawService:
                 errors.append(f"Duplicate participant_id {participant_id!r}.")
                 continue
             player_id = row.get("player_id")
+            mapped_player_id = mapping.get(participant_id)
+            if mapped_player_id is None and isinstance(row.get("name"), str):
+                mapped_player_id = mapping.get(row["name"])
+            if mapped_player_id is not None:
+                if not isinstance(mapped_player_id, str):
+                    errors.append(f"Player mapping for {participant_id!r} must be a player ID string.")
+                    continue
+                player_id = mapped_player_id
             player = players_by_id.get(player_id) if isinstance(player_id, str) else None
             if player is None and isinstance(row.get("name"), str):
                 candidates = by_name.get(row["name"].casefold(), [])
@@ -2263,6 +2676,14 @@ class TournamentDrawService:
         knockout_round_players = {}
         normalized_matches = []
         normalized_byes = []
+        source_round_by_id = {}
+        for source_index, source_row in enumerate(matches, start=1):
+            if not isinstance(source_row, dict):
+                continue
+            source_id = source_row.get("match_id") or f"imported-match-{source_index}"
+            if isinstance(source_id, str):
+                source_round_by_id[source_id] = source_row.get("round", 1)
+        used_knockout_sources = {}
         for index, row in enumerate(matches, start=1):
             if not isinstance(row, dict):
                 errors.append(f"Match {index} must be an object.")
@@ -2275,16 +2696,20 @@ class TournamentDrawService:
             p1_ref, p2_ref = row.get("player_one"), row.get("player_two")
             bye_ref = row.get("bye_player")
             round_no, slot_no = row.get("round", 1), row.get("slot", index)
+            if any(not isinstance(value, int) or isinstance(value, bool) or value < 1
+                   for value in (round_no, slot_no)):
+                errors.append(f"Match {match_id!r} has an invalid round or slot.")
+                continue
+            position = (round_no, slot_no)
+            if position in match_positions:
+                errors.append(f"Multiple matches/byes use round {round_no}, slot {slot_no}.")
+            match_positions.add(position)
             if (format_name == "knockout" and isinstance(bye_ref, str)
                     and bye_ref in resolved):
-                if any(not isinstance(value, int) or isinstance(value, bool) or value < 1
-                       for value in (round_no, slot_no)):
-                    errors.append(f"Bye {bye_ref!r} has an invalid round or slot.")
-                    continue
-                position = (round_no, slot_no)
-                if position in match_positions:
-                    errors.append(f"Multiple matches/byes use round {round_no}, slot {slot_no}.")
-                match_positions.add(position)
+                if round_no != 1:
+                    errors.append(
+                        "Imported byes must be in round 1; later-round entrants must use winner_of references."
+                    )
                 round_players = knockout_round_players.setdefault(round_no, set())
                 if bye_ref in round_players:
                     errors.append(
@@ -2292,9 +2717,39 @@ class TournamentDrawService:
                     )
                 round_players.add(bye_ref)
                 normalized_byes.append({
+                    "match_id": match_id,
                     "player_id": resolved[bye_ref].player_id,
                     "round": round_no,
                     "slot": slot_no,
+                })
+                continue
+            winner_of = row.get("winner_of")
+            if format_name == "knockout" and winner_of is not None:
+                if (not isinstance(winner_of, list) or len(winner_of) != 2
+                        or any(not isinstance(source_id, str) or not source_id
+                               for source_id in winner_of)
+                        or len(set(winner_of)) != 2):
+                    errors.append(f"Knockout match {match_id!r} needs two distinct winner_of match IDs.")
+                    continue
+                if round_no < 2:
+                    errors.append(f"Knockout match {match_id!r} cannot use winner_of in round 1.")
+                    continue
+                for source_id in winner_of:
+                    source_round = source_round_by_id.get(source_id)
+                    if source_round != round_no - 1:
+                        errors.append(
+                            f"Knockout match {match_id!r} must reference matches/byes from round {round_no - 1}."
+                        )
+                    used = used_knockout_sources.setdefault(round_no, set())
+                    if source_id in used:
+                        errors.append(f"Knockout source {source_id!r} advances more than once in round {round_no}.")
+                    used.add(source_id)
+                normalized_matches.append({
+                    "match_id": match_id,
+                    "winner_of": list(winner_of),
+                    "round": round_no,
+                    "slot": slot_no,
+                    "table": row.get("table"),
                 })
                 continue
             if not isinstance(p1_ref, str) or not isinstance(p2_ref, str):
@@ -2306,11 +2761,11 @@ class TournamentDrawService:
             if p1_ref == p2_ref:
                 errors.append(f"Match {match_id!r} assigns a player against themselves.")
                 continue
-            if any(not isinstance(value, int) or isinstance(value, bool) or value < 1
-                   for value in (round_no, slot_no)):
-                errors.append(f"Match {match_id!r} has an invalid round or slot.")
-                continue
             if format_name == "knockout":
+                if round_no > 1:
+                    errors.append(
+                        f"Knockout match {match_id!r} in a later round must use winner_of references, not entrant IDs."
+                    )
                 round_players = knockout_round_players.setdefault(round_no, set())
                 repeated = {p1_ref, p2_ref}.intersection(round_players)
                 if repeated:
@@ -2318,10 +2773,6 @@ class TournamentDrawService:
                         f"Knockout participant(s) {', '.join(sorted(repeated))} appear more than once in round {round_no}."
                     )
                 round_players.update((p1_ref, p2_ref))
-            position = (round_no, slot_no)
-            if position in match_positions:
-                errors.append(f"Multiple matches use round {round_no}, slot {slot_no}.")
-            match_positions.add(position)
             pair = frozenset((p1_ref, p2_ref))
             if pair in pairs_seen:
                 errors.append(f"Duplicate fixture for participants {p1_ref!r} and {p2_ref!r}.")
@@ -2336,13 +2787,24 @@ class TournamentDrawService:
             })
         if not normalized_matches:
             warnings.append("The draw contains no playable matches.")
-        if format_name == "knockout" and normalized_matches:
-            first_round = min(row["round"] for row in normalized_matches)
+        if format_name == "knockout" and (normalized_matches or normalized_byes):
+            first_round = min(
+                [row["round"] for row in normalized_matches + normalized_byes]
+            )
             first_round_players = knockout_round_players.get(first_round, set())
             if first_round_players != set(resolved):
-                warnings.append(
-                    "The first imported knockout round does not include every entrant; verify the draw and byes."
+                errors.append(
+                    "The first imported knockout round must assign every entrant exactly once, either to a match or a bye."
                 )
+            for round_no, used_sources in used_knockout_sources.items():
+                expected_sources = {
+                    source_id for source_id, source_round in source_round_by_id.items()
+                    if source_round == round_no - 1
+                }
+                if expected_sources != used_sources:
+                    errors.append(
+                        f"Knockout round {round_no} must advance every prior-round match and bye exactly once."
+                    )
         if format_name == "round_robin" and len(normalized_entrants) >= 2:
             expected = len(normalized_entrants) * (len(normalized_entrants) - 1) // 2
             if len(pairs_seen) < expected:
@@ -2362,19 +2824,28 @@ class TournamentDrawService:
 
     @classmethod
     def preview_csv(cls, csv_text, players, name, format_name, game_config,
-                    tie_break_settings=None):
+                    tie_break_settings=None, player_mapping=None):
         players_by_id = (
             players if isinstance(players, dict)
             else {player.player_id: player for player in players}
         )
         try:
-            rows = list(csv.DictReader(io.StringIO(csv_text)))
+            reader = csv.DictReader(io.StringIO(csv_text))
+            fieldnames = reader.fieldnames or []
+            rows = list(reader)
         except (csv.Error, TypeError) as error:
             return {"valid": False, "errors": [f"Invalid CSV: {error}"], "warnings": []}
         required = {"player_one_id", "player_two_id", "round", "slot"}
+        mapping = player_mapping or {}
+        if not isinstance(mapping, dict):
+            return {"valid": False, "errors": ["player_mapping must be an object."], "warnings": []}
         if not rows:
             return {"valid": False, "errors": ["CSV contains no match rows."], "warnings": []}
-        if not required.issubset(rows[0].keys()):
+        if (any(not isinstance(header, str) or not header.strip() for header in fieldnames)
+                or len(fieldnames) != len(set(fieldnames))):
+            return {"valid": False, "errors": ["CSV headers must be non-empty and unique."], "warnings": []}
+        headers = set(fieldnames)
+        if not required.issubset(headers):
             return {"valid": False, "errors": [
                 f"CSV needs columns: {', '.join(sorted(required))}."
             ], "warnings": []}
@@ -2382,10 +2853,19 @@ class TournamentDrawService:
         seen = set()
         matches = []
         for index, row in enumerate(rows, start=1):
+            if None in row:
+                return {"valid": False, "errors": [f"CSV row {index} has more values than headers."], "warnings": []}
+            mapped_ids = {}
             for column in ("player_one_id", "player_two_id"):
-                player_id = row[column]
+                imported_id = row[column]
+                if not isinstance(imported_id, str) or not imported_id.strip():
+                    return {"valid": False, "errors": [f"CSV row {index} has a blank {column}."], "warnings": []}
+                player_id = mapping.get(imported_id, imported_id)
+                if not isinstance(player_id, str):
+                    return {"valid": False, "errors": [f"Mapping for CSV ID {imported_id!r} must be a player ID string."], "warnings": []}
                 if player_id not in players_by_id:
-                    return {"valid": False, "errors": [f"CSV row {index} has unknown player ID {player_id!r}."], "warnings": []}
+                    return {"valid": False, "errors": [f"CSV row {index} has unknown player ID {imported_id!r}; map it to an existing player ID."], "warnings": []}
+                mapped_ids[column] = player_id
                 if player_id not in seen:
                     seen.add(player_id)
                     entrants.append({"participant_id": player_id, "player_id": player_id})
@@ -2393,8 +2873,8 @@ class TournamentDrawService:
                 "match_id": row.get("match_id") or f"csv-match-{index}",
                 "round": row["round"],
                 "slot": row["slot"],
-                "player_one": row["player_one_id"],
-                "player_two": row["player_two_id"],
+                "player_one": mapped_ids["player_one_id"],
+                "player_two": mapped_ids["player_two_id"],
                 "table": row.get("table_assignment"),
             })
         try:
@@ -2409,12 +2889,14 @@ class TournamentDrawService:
                 "name": name,
                 "format": format_name,
                 "game_config": game_config,
-                "tie_break_settings": tie_break_settings,
+                "tie_break_settings": tie_break_settings or [
+                    "match_wins", "game_difference", "games_won"
+                ],
             },
             "entrants": entrants,
             "matches": matches,
         }
-        return cls.preview_json(payload, players)
+        return cls.preview_json(payload, players, player_mapping=player_mapping)
 
     @staticmethod
     def apply_preview(preview, players, confirmed=False, reason="Confirmed draw import"):
@@ -2440,7 +2922,10 @@ class TournamentDrawService:
         for row in preview["entrants"]:
             tournament.seeds[row["player_id"]] = row.get("seed")
         tournament.matches = []
-        for row in preview["matches"]:
+        concrete_matches = [
+            row for row in preview["matches"] if "winner_of" not in row
+        ] if isinstance(tournament, kot) else preview["matches"]
+        for row in concrete_matches:
             match = Match(players_by_id[row["player_one_id"]], players_by_id[row["player_two_id"]],
                           details["game_config"])
             match.match_id = row["match_id"]
@@ -2456,10 +2941,11 @@ class TournamentDrawService:
         }
         if isinstance(tournament, kot):
             round_rows = {}
-            for row in preview["matches"]:
+            for row in concrete_matches:
                 entry = round_rows.setdefault(row["round"], {
                     "round": row["round"], "entrant_ids": [],
-                    "bye_player_id": None, "match_ids": [], "completed": False,
+                    "bye_player_id": None, "bye_player_ids": [],
+                    "bye_match_ids": [], "match_ids": [], "completed": False,
                 })
                 entry["match_ids"].append(row["match_id"])
                 for player_id in (row["player_one_id"], row["player_two_id"]):
@@ -2468,20 +2954,32 @@ class TournamentDrawService:
             for bye in preview.get("byes", []):
                 entry = round_rows.setdefault(bye["round"], {
                     "round": bye["round"], "entrant_ids": [],
-                    "bye_player_id": None, "match_ids": [], "completed": False,
+                    "bye_player_id": None, "bye_player_ids": [],
+                    "bye_match_ids": [], "match_ids": [], "completed": False,
                 })
-                entry["bye_player_id"] = bye["player_id"]
+                if entry["bye_player_id"] is None:
+                    entry["bye_player_id"] = bye["player_id"]
+                entry["bye_player_ids"].append(bye["player_id"])
+                entry["bye_match_ids"].append(bye["match_id"])
                 if bye["player_id"] not in entry["entrant_ids"]:
                     entry["entrant_ids"].append(bye["player_id"])
             tournament.draw_metadata["rounds"] = [round_rows[key] for key in sorted(round_rows)]
+            tournament.draw_metadata["byes"] = copy.deepcopy(preview.get("byes", []))
+            tournament.draw_metadata["match_plans"] = [
+                copy.deepcopy(row) for row in preview["matches"]
+                if "winner_of" in row
+            ]
         tournament.record_change("import_draw", "tournament", tournament.tournament_id,
                                  None, tournament.original_draw, reason)
         return tournament
 
 
 def export_tournament_package(tournament, output_directory):
-    package_dir = Path(output_directory) / f"tournament_{tournament.tournament_id}"
-    package_dir.mkdir(parents=True, exist_ok=True)
+    output_root = Path(output_directory)
+    output_root.mkdir(parents=True, exist_ok=True)
+    export_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    final_package_dir = output_root / f"tournament_{tournament.tournament_id}_{export_stamp}"
+    package_dir = Path(tempfile.mkdtemp(prefix=".tournament_export_", dir=output_root))
 
     payload = {
         "schema_version": STATE_SCHEMA_VERSION,
@@ -2612,14 +3110,16 @@ def export_tournament_package(tournament, output_directory):
         "standings.csv is derived from currently recorded completed match results. Missing values are left blank.\n"
     )
     atomic_write_text(manifest_path, manifest)
+    os.replace(package_dir, final_package_dir)
+    package_dir = final_package_dir
     return {
         "directory": str(package_dir),
-        "json": str(json_path),
-        "matches_csv": str(matches_csv_path),
-        "events_csv": str(events_csv_path),
-        "statistics_csv": str(statistics_csv_path),
-        "standings_csv": str(standings_path),
-        "manifest": str(manifest_path),
+        "json": str(package_dir / "tournament.json"),
+        "matches_csv": str(package_dir / "matches.csv"),
+        "events_csv": str(package_dir / "events.csv"),
+        "statistics_csv": str(package_dir / "player_statistics.csv"),
+        "standings_csv": str(package_dir / "standings.csv"),
+        "manifest": str(package_dir / "README.txt"),
     }
 
 
@@ -2790,10 +3290,12 @@ def main():
         print("5. Create tournament")
         print("6. Run or resume tournament")
         print("7. Edit tournament match/result")
-        print("8. Import a JSON draw")
+        print("8. Import a JSON or CSV draw")
         print("9. Export tournament package")
         print("10. View player statistics")
-        print("11. Save and quit")
+        print("11. View tournament standings or bracket")
+        print("12. Restore a timestamped state backup")
+        print("13. Save and quit")
         choice = input("Choose an action: ").strip()
         try:
             if choice == "1":
@@ -2860,7 +3362,14 @@ def main():
                     tournament.run()
             elif choice == "7":
                 tournament = _choose_tournament(tournaments)
-                action = input("Action: (1) Reschedule (2) Postpone (3) Cancel (4) Reopen (5) Correct winner (6) Pause progression (7) Resume progression: ").strip()
+                action = input(
+                    "Action: (1) Reschedule (2) Postpone (3) Cancel (4) Reopen "
+                    "(5) Correct winner (6) Pause progression (7) Resume progression "
+                    "(8) Manually advance knockout round (9) View audit history "
+                    "(10) Walkover (11) Retirement (12) Add entrant (13) Withdraw entrant "
+                    "(14) Replace entrant (15) Edit seed (16) Swap match positions "
+                    "(17) Edit match order: "
+                ).strip()
                 if action in {"6", "7"}:
                     reason = input("Reason for the change: ").strip()
                     if action == "6":
@@ -2868,6 +3377,90 @@ def main():
                     else:
                         tournament.resume_progression(reason)
                     continue
+                if action == "8":
+                    if not isinstance(tournament, kot):
+                        raise ValueError("Manual round advancement applies only to knockout tournaments.")
+                    round_record = next(
+                        (row for row in tournament.draw_metadata.get("rounds", [])
+                         if row.get("round") == tournament.round_number),
+                        None,
+                    )
+                    if round_record is None or round_record.get("completed"):
+                        raise ValueError("There is no incomplete knockout round to advance.")
+                    match_map = {match.match_id: match for match in tournament.matches}
+                    winners_by_match = {}
+                    for match_id in round_record.get("match_ids", []):
+                        match = match_map.get(match_id)
+                        if match is None:
+                            raise ValueError(f"Saved round references missing match {match_id!r}.")
+                        print(f"{match.match_id}: {match.player_one.name} vs {match.player_two.name} [{match.status}]")
+                        if match.match_finished and match.match_winner is not None:
+                            print(f"Recorded winner: {match.match_winner.name}")
+                            winners_by_match[match.match_id] = match.match_winner.player_id
+                        else:
+                            winner = _choose_player({
+                                match.player_one.player_id: match.player_one,
+                                match.player_two.player_id: match.player_two,
+                            }, "Advancing player number: ")
+                            winners_by_match[match.match_id] = winner.player_id
+                    reason = input("Reason for manual advancement: ").strip()
+                    tournament.advance_round_manually(winners_by_match, reason)
+                    continue
+                if action == "9":
+                    print(json.dumps(tournament.audit_log, indent=2, ensure_ascii=False))
+                    continue
+                if action in {"12", "13", "14", "15"}:
+                    reason = input("Reason for the change: ").strip()
+                    tournament_players = {p.player_id: p for p in tournament.players}
+                    if action == "12":
+                        available = {key: value for key, value in players.items()
+                                     if key not in tournament_players}
+                        entrant = _choose_player(available, "New entrant number: ")
+                        tournament.add_entrant(entrant, reason)
+                    elif action == "13":
+                        entrant = _choose_player(tournament_players, "Entrant to withdraw: ")
+                        tournament.remove_entrant(entrant.player_id, reason)
+                    elif action == "14":
+                        old_player = _choose_player(tournament_players, "Entrant to replace: ")
+                        available = {key: value for key, value in players.items()
+                                     if key not in tournament_players}
+                        new_player = _choose_player(available, "Replacement player: ")
+                        tournament.replace_entrant(old_player.player_id, new_player, reason)
+                    else:
+                        entrant = _choose_player(tournament_players, "Entrant to reseed: ")
+                        raw_seed = input("New seed (blank to clear): ").strip()
+                        seed = int(raw_seed) if raw_seed else None
+                        tournament.set_seed(entrant.player_id, seed, reason)
+                    continue
+                if action == "16":
+                    if len(tournament.matches) < 2:
+                        raise ValueError("At least two matches are needed to swap bracket positions.")
+                    for index, item in enumerate(tournament.matches, start=1):
+                        print(f"{index}. {item.match_id}: {item.player_one.name} vs {item.player_two.name}")
+                    first_index = int(input("First match number: ").strip()) - 1
+                    second_index = int(input("Second match number: ").strip()) - 1
+                    if (not 0 <= first_index < len(tournament.matches)
+                            or not 0 <= second_index < len(tournament.matches)
+                            or first_index == second_index):
+                        raise ValueError("Choose two different listed matches.")
+                    first_match = tournament.matches[first_index]
+                    second_match = tournament.matches[second_index]
+                    first_player = _choose_player({
+                        first_match.player_one.player_id: first_match.player_one,
+                        first_match.player_two.player_id: first_match.player_two,
+                    }, "Player to move from first match: ")
+                    second_player = _choose_player({
+                        second_match.player_one.player_id: second_match.player_one,
+                        second_match.player_two.player_id: second_match.player_two,
+                    }, "Player to move from second match: ")
+                    reason = input("Reason for the change: ").strip()
+                    tournament.swap_match_players(
+                        first_match.match_id, first_player.player_id,
+                        second_match.match_id, second_player.player_id, reason,
+                    )
+                    continue
+                if action not in {"1", "2", "3", "4", "5", "10", "11", "17"}:
+                    raise ValueError("Choose one of the listed tournament actions.")
                 if not tournament.matches:
                     raise ValueError("This tournament has no scheduled matches.")
                 for index, match in enumerate(tournament.matches, start=1):
@@ -2882,6 +3475,10 @@ def main():
                     slot_no = int(input("New slot: ").strip())
                     table = input("Table/court assignment (blank if none): ").strip() or None
                     tournament.reschedule_match(match.match_id, round_no, slot_no, table, reason)
+                elif action == "17":
+                    round_no = int(input("New round: ").strip())
+                    slot_no = int(input("New slot: ").strip())
+                    tournament.set_match_order(match.match_id, round_no, slot_no, reason)
                 elif action == "2":
                     tournament.set_match_status(match.match_id, "postponed", reason)
                 elif action == "3":
@@ -2894,12 +3491,44 @@ def main():
                         match.player_two.player_id: match.player_two,
                     }, "Winner number: ")
                     tournament.correct_match_result(match.match_id, winner.player_id, reason)
+                elif action in {"10", "11"}:
+                    winner = _choose_player({
+                        match.player_one.player_id: match.player_one,
+                        match.player_two.player_id: match.player_two,
+                    }, "Winner number: ")
+                    tournament.set_match_status(
+                        match.match_id,
+                        "walkover" if action == "10" else "retired",
+                        reason,
+                        winner_id=winner.player_id,
+                    )
                 else:
                     raise ValueError("Choose one of the listed actions.")
             elif choice == "8":
                 draw_path = Path(input("JSON draw file path: ").strip())
                 source = draw_path.read_text(encoding="utf-8")
-                preview = TournamentDrawService.preview_json(source, players)
+                mapping_text = input(
+                    "Optional participant-ID to existing player-ID mapping as JSON (Enter for none): "
+                ).strip()
+                mapping = json.loads(mapping_text) if mapping_text else {}
+                if draw_path.suffix.lower() == ".csv":
+                    name = input("Tournament name: ").strip()
+                    format_choice = input("Format: (1) Round robin (2) Knockout: ").strip()
+                    if format_choice not in {"1", "2"}:
+                        raise ValueError("Choose round robin (1) or knockout (2).")
+                    format_name = "round_robin" if format_choice == "1" else "knockout"
+                    tie_breaks = None
+                    if format_name == "round_robin":
+                        value = input("Tie-break order (comma separated, Enter for default): ").strip()
+                        tie_breaks = [item.strip() for item in value.split(",") if item.strip()] if value else None
+                    preview = TournamentDrawService.preview_csv(
+                        source, players, name, format_name, _choose_game_config(),
+                        tie_break_settings=tie_breaks, player_mapping=mapping,
+                    )
+                else:
+                    preview = TournamentDrawService.preview_json(
+                        source, players, player_mapping=mapping,
+                    )
                 for warning in preview.get("warnings", []):
                     print("Warning:", warning)
                 if not preview["valid"]:
@@ -2931,15 +3560,47 @@ def main():
                 stats = StatisticsService.player_statistics(player.player_id, all_matches)
                 print(json.dumps(stats, indent=2, ensure_ascii=False))
             elif choice == "11":
+                tournament = _choose_tournament(tournaments)
+                if isinstance(tournament, rrt):
+                    tournament.recalculate_standings()
+                    print("Tie-break order:", ", ".join(tournament.tie_break_settings))
+                    tournament.print_standings()
+                else:
+                    print(f"Round {tournament.round_number}; current entrants:")
+                    for player in tournament.current_players:
+                        print(f"- {player.name} ({player.player_id})")
+                    for match in sorted(
+                        tournament.matches,
+                        key=lambda item: (item.round_number or 0, item.slot_number or 0),
+                    ):
+                        winner = match.match_winner.name if match.match_winner else "pending"
+                        print(
+                            f"Round {match.round_number}, slot {match.slot_number}: "
+                            f"{match.player_one.name} vs {match.player_two.name} "
+                            f"[{match.status}; winner: {winner}]"
+                        )
+            elif choice == "12":
+                backups = storage.list_state_backups()
+                if not backups:
+                    raise ValueError("No timestamped state backups are available.")
+                for index, backup in enumerate(backups, start=1):
+                    print(f"{index}. {backup.name}")
+                selected = input("Backup number to restore: ").strip()
+                if not selected.isdigit() or not 1 <= int(selected) <= len(backups):
+                    raise ValueError("Choose a listed backup number.")
+                backup_file(storage.state_filename)
+                restored = storage.restore_state_backup(backups[int(selected) - 1])
+                print(f"Restored {restored}. Restart the app to load the restored state.")
+                return
+            elif choice == "13":
                 save_state()
                 print("Saved.")
                 return
             else:
-                print("Choose a number from 1 to 11.")
-        except (ValueError, OSError, IndexError) as error:
+                print("Choose a number from 1 to 13.")
+        except (ValueError, OSError, IndexError, RuntimeError) as error:
             print(f"Could not complete that action: {error}")
 
 
 if __name__ == "__main__":
     main()
-
