@@ -30,6 +30,15 @@ Run the backend test suite:
 
 `python -m unittest -v`
 
-## Next
+## Frontend preview
 
-The backend is ready for frontend work. Frontend design and interaction details are pending from Aryan before implementation begins.
+The React, TypeScript, and Vite frontend lives in `frontend/`. It provides the Rallydesk workspace, player directory, single-match setup and scoring, round-robin and knockout tournaments, statistics, imports/exports, settings, and About/support pages. New workspaces are empty; organisers add their own names and club details.
+
+Run the browser preview from the frontend directory:
+
+```powershell
+pnpm install
+pnpm run dev
+```
+
+Create a production build with `pnpm run build`. The current frontend is a local browser preview stored in `localStorage`; Firebase Authentication, Firestore, legal/consent flows, and production hardening are not connected. See `frontend/UX-CONTRACT.md` for interaction rules and `frontend/QA_RESULTS.md` for the latest browser acceptance results and remaining checks.

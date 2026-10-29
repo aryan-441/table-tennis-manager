@@ -15,3 +15,6 @@ credentials.*
 *.pem
 *.p12
 *.pfx
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
